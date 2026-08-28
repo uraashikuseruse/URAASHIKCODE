@@ -1,0 +1,261 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "../Type";
+import {
+  ADHKAR_OCCASIONS,
+  type AdhkarOccasion,
+  type Dhikr,
+  filterByOccasion,
+  isDhikrComplete,
+  nextTally,
+  sessionProgress,
+} from "@ummahlibrary/core";
+import { api, ApiError } from "../api";
+import { KEYS, getJSON, setJSON } from "../storage";
+import { useTheme, type Palette } from "../theme";
+import { FONT } from "../fonts";
+import { adhkarToday } from "../utils";
+import { AdhkarReminderToggle } from "../components/AdhkarReminderToggle";
+
+interface Stored {
+  date: string;
+  counts: Record<string, number>;
+}
+
+async function loadCounts(): Promise<Record<string, number>> {
+  const stored = await getJSON<Stored>(KEYS.adhkar, { date: "", counts: {} });
+  return stored.date === adhkarToday() ? stored.counts : {};
+}
+
+async function saveCounts(counts: Record<string, number>): Promise<void> {
+  await setJSON(KEYS.adhkar, { date: adhkarToday(), counts });
+}
+
+export function AdhkarScreen() {
+  const { colors } = useTheme();
+  const styles = useMemo(() => makeStyles(colors), [colors]);
+
+  const [dhikr, setDhikr] = useState<Dhikr[]>([]);
+  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [occasion, setOccasion] = useState<AdhkarOccasion>("morning");
+  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [error, setError] = useState<ApiError | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
+  const retry = useCallback(() => {
+    setStatus("loading");
+    setReloadToken((t) => t + 1);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([api.listAdhkar(), loadCounts()])
+      .then(([fetched, saved]) => {
+        if (!active) return;
+        setDhikr(fetched);
+        setCounts(saved);
+        setStatus("ready");
+      })
+      .catch((e: unknown) => {
+        if (!active) return;
+        setError(e instanceof ApiError ? e : new ApiError("Failed", { isNetworkError: true }));
+        setStatus("error");
+      });
+    return () => { active = false; };
+  }, [reloadToken]);
+
+  function tap(d: Dhikr) {
+    setCounts((prev) => {
+      const next = { ...prev, [d.id]: nextTally(prev[d.id] ?? 0, d.repeat) };
+      void saveCounts(next);
+      return next;
+    });
+  }
+
+  function reset() {
+    setCounts((prev) => {
+      const next = { ...prev };
+      for (const d of items) delete next[d.id];
+      void saveCounts(next);
+      return next;
+    });
+  }
+
+  const items = useMemo(() => filterByOccasion(dhikr, occasion), [dhikr, occasion]);
+  const progress = sessionProgress(items, counts);
+  const allDone = progress.total > 0 && progress.completed === progress.total;
+
+  if (status === "loading") {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator color={colors.accent} />
+      </View>
+    );
+  }
+
+  if (status === "error") {
+    const message =
+      error && !error.isNetworkError && error.status && error.status >= 500
+        ? "The server is starting up. Try again in a moment."
+        : "Could not load adhkar. Check your connection.";
+    return (
+      <View style={styles.center}>
+        <Text style={styles.errorText}>{message}</Text>
+        <Pressable style={styles.chip} onPress={retry}>
+          <Text style={styles.chipText}>Try again</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  return (
+    <ScrollView contentContainerStyle={styles.screen}>
+      <AdhkarReminderToggle />
+      <View style={styles.tabs} accessibilityRole="tablist">
+        {ADHKAR_OCCASIONS.map((o) => (
+          <Pressable
+            key={o.id}
+            style={[styles.tab, o.id === occasion && styles.tabOn]}
+            onPress={() => setOccasion(o.id)}
+            accessibilityRole="tab"
+            accessibilityState={{ selected: o.id === occasion }}
+          >
+            <Text style={[styles.tabText, o.id === occasion && styles.tabTextOn]}>{o.label}</Text>
+            <Text style={[styles.tabAr, o.id === occasion && styles.tabTextOn]}>{o.arabic}</Text>
+          </Pressable>
+        ))}
+      </View>
+
+      <View style={[styles.progressRow, allDone && styles.progressRowDone]}>
+        <View style={styles.progressTrack}>
+          <View
+            style={[
+              styles.progressFill,
+              { width: `${progress.total ? (progress.completed / progress.total) * 100 : 0}%` },
+            ]}
+          />
+        </View>
+        <Text style={[styles.progressText, allDone && styles.progressTextDone]}>
+          {allDone ? "Completed for today 🤍" : `${progress.completed} / ${progress.total} done`}
+        </Text>
+        <Pressable style={styles.resetChip} onPress={reset}>
+          <Text style={styles.resetChipText}>Reset</Text>
+        </Pressable>
+      </View>
+
+      {items.map((d) => {
+        const count = counts[d.id] ?? 0;
+        const done = isDhikrComplete(count, d.repeat);
+        return (
+          <Pressable
+            key={d.id}
+            style={[styles.card, done && styles.cardDone]}
+            onPress={() => tap(d)}
+            accessibilityLabel={`${d.transliteration}, tap to count, ${count} of ${d.repeat}`}
+          >
+            <Text style={styles.arabic}>{d.arabic}</Text>
+            <Text style={styles.translit}>{d.transliteration}</Text>
+            <Text style={styles.translation}>{d.translation}</Text>
+            {(d.virtue || d.source) && (
+              <Text style={styles.meta}>{[d.virtue, d.source].filter(Boolean).join(" · ")}</Text>
+            )}
+            <View style={styles.cardFoot}>
+              <View style={styles.progressWrap}>
+                <View style={styles.miniTrack}>
+                  <View
+                    style={[styles.miniFill, { width: `${Math.min(1, count / d.repeat) * 100}%` }]}
+                  />
+                </View>
+                <Text style={styles.count}>
+                  {count} / {d.repeat}
+                </Text>
+              </View>
+              <Text style={[styles.status, done && styles.statusDone]}>
+                {done ? "✓ Done" : "Tap to count"}
+              </Text>
+            </View>
+          </Pressable>
+        );
+      })}
+
+      <Text style={styles.foot}>
+        Tap a dhikr to count · progress resets each day · adhkar from Ḥiṣn al-Muslim
+      </Text>
+    </ScrollView>
+  );
+}
+
+function makeStyles(c: Palette) {
+  return StyleSheet.create({
+    screen: { padding: 16, backgroundColor: c.bg, gap: 10, paddingBottom: 32 },
+    center: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: c.bg, gap: 14 },
+    errorText: { color: c.error, fontSize: 15, textAlign: "center", paddingHorizontal: 24 },
+    chip: {
+      paddingVertical: 6,
+      paddingHorizontal: 12,
+      borderRadius: 20,
+      borderWidth: 1,
+      borderColor: c.border,
+    },
+    chipText: { color: c.muted, fontSize: 13 },
+    tabs: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 4 },
+    tab: {
+      paddingVertical: 10,
+      paddingHorizontal: 14,
+      borderRadius: 10,
+      borderWidth: 1,
+      borderColor: c.border,
+      alignItems: "center",
+      gap: 2,
+    },
+    tabOn: { borderColor: c.accent, backgroundColor: c.accentSoft },
+    tabText: { color: c.muted, fontSize: 14, fontWeight: "600" },
+    tabAr: { color: c.muted, fontSize: 12 },
+    tabTextOn: { color: c.accent },
+    progressRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 8,
+      padding: 10,
+      borderRadius: 10,
+      backgroundColor: c.bgElev,
+      borderWidth: 1,
+      borderColor: c.border,
+    },
+    progressRowDone: { borderColor: c.accent, backgroundColor: c.accentSoft },
+    progressTrack: { flex: 1, height: 4, borderRadius: 2, backgroundColor: c.border, overflow: "hidden" },
+    progressFill: { height: 4, borderRadius: 2, backgroundColor: c.accent },
+    progressText: { color: c.muted, fontSize: 12 },
+    progressTextDone: { color: c.accent },
+    resetChip: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6, borderWidth: 1, borderColor: c.border },
+    resetChipText: { color: c.muted, fontSize: 12 },
+    card: {
+      backgroundColor: c.bgElev,
+      borderRadius: 12,
+      borderWidth: 1,
+      borderColor: c.border,
+      padding: 14,
+      gap: 6,
+    },
+    cardDone: { borderColor: c.accent, backgroundColor: c.accentSoft },
+    cardHead: { flexDirection: "row", justifyContent: "space-between" },
+    cardNum: { color: c.muted, fontSize: 12, fontWeight: "600" },
+    counter: { color: c.muted, fontSize: 12, fontWeight: "600" },
+    accentText: { color: c.accent },
+    arabic: { color: c.fg, fontSize: 22, lineHeight: 38, writingDirection: "rtl", fontFamily: FONT.ar },
+    translit: { color: c.accent, fontSize: 13.5, fontStyle: "italic" },
+    translation: { color: c.muted, fontSize: 14, lineHeight: 21 },
+    meta: { color: c.faint, fontSize: 11, lineHeight: 16, marginTop: 2 },
+    cardFoot: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginTop: 8,
+    },
+    progressWrap: { flexDirection: "row", alignItems: "center", gap: 10 },
+    miniTrack: { width: 90, height: 6, borderRadius: 3, backgroundColor: c.border, overflow: "hidden" },
+    miniFill: { height: 6, borderRadius: 3, backgroundColor: c.accent },
+    count: { color: c.faint, fontSize: 12.5 },
+    status: { color: c.faint, fontSize: 12.5, fontFamily: FONT.bold },
+    statusDone: { color: c.accent },
+    foot: { color: c.faint, fontSize: 11, textAlign: "center", marginTop: 8 },
+  });
+}

@@ -1,0 +1,553 @@
+"use client";
+
+import type { CSSProperties } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  CALCULATION_METHODS,
+  type Coordinates,
+  DEFAULT_CALCULATION_METHOD,
+  DEFAULT_HIGH_LATITUDE_RULE,
+  type ExtendedPrayerTimings,
+  HIGH_LATITUDE_RULES,
+  type HighLatitudeRuleId,
+  type Madhab,
+  MADHABS,
+  type NotifyPermission,
+  OBLIGATORY_PRAYERS,
+  PRAYER_LABELS,
+  type PrayerName,
+  SUPPLEMENTARY_TIMING_LABELS,
+  SUPPLEMENTARY_TIMING_NAMES,
+  TIMING_NAMES,
+  nextPrayer,
+} from "@ummahlibrary/core";
+import { Icon, Khatam, N } from "@ummahlibrary/ui";
+import {
+  type PrayerReminderPrefs,
+  readPrayerReminderPrefs,
+  setPrayerReminder,
+} from "../lib/prayer-reminders";
+import { fmtPrayerTime } from "../lib/prayer-time-format";
+import { webPrayerSettingsStore } from "../lib/prayer-settings-store";
+import { WebNotifier } from "../lib/web-notifier";
+
+type Status = "idle" | "locating" | "loading" | "ready" | "error" | "denied";
+
+/** Local calendar date as YYYY-MM-DD (not UTC — prayer times are a local concept). */
+function localDate(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function countdown(target: Date, now: Date): string {
+  if (Number.isNaN(target.getTime())) return "—"; // invalid target (e.g. a polar empty Fajr)
+  let s = Math.max(0, Math.floor((target.getTime() - now.getTime()) / 1000));
+  const h = Math.floor(s / 3600);
+  s -= h * 3600;
+  const m = Math.floor(s / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+interface WeekDay {
+  date: Date;
+  label: string;
+  isToday: boolean;
+  timings: ExtendedPrayerTimings | null;
+}
+
+/** The seven days of the current week (Mon–Sun) for the "This week" table. */
+function weekDays(today: Date): Omit<WeekDay, "timings">[] {
+  const start = new Date(today);
+  const day = start.getDay(); // 0 = Sun … 6 = Sat
+  start.setDate(start.getDate() + (day === 0 ? -6 : 1 - day)); // back to Monday
+  start.setHours(0, 0, 0, 0);
+  const todayKey = localDate(today);
+  return Array.from({ length: 7 }, (_, i) => {
+    const date = new Date(start);
+    date.setDate(start.getDate() + i);
+    return {
+      date,
+      label: date.toLocaleDateString([], { weekday: "short" }),
+      isToday: localDate(date) === todayKey,
+    };
+  });
+}
+
+const cardStyle: CSSProperties = {
+  background: N.card,
+  border: `1px solid ${N.border}`,
+  borderRadius: 16,
+};
+
+export function PrayerTimesView() {
+  const [coords, setCoords] = useState<Coordinates | null>(null);
+  const [method, setMethod] = useState(DEFAULT_CALCULATION_METHOD);
+  const [madhab, setMadhab] = useState<Madhab>("shafi");
+  const [highLat, setHighLat] = useState<HighLatitudeRuleId>(DEFAULT_HIGH_LATITUDE_RULE);
+  const [timings, setTimings] = useState<ExtendedPrayerTimings | null>(null);
+  const [week, setWeek] = useState<WeekDay[]>([]);
+  const [status, setStatus] = useState<Status>("idle");
+  const [now, setNow] = useState(() => new Date());
+  const [reminders, setReminders] = useState<PrayerReminderPrefs>({});
+  const [permission, setPermission] = useState<NotifyPermission>("default");
+  const reqId = useRef(0);
+  const notifierRef = useRef<WebNotifier | null>(null);
+  const getNotifier = () => (notifierRef.current ??= new WebNotifier());
+
+  // Fetch the whole current week in parallel; today's card is derived from it.
+  const fetchTimings = useCallback(
+    async (c: Coordinates, m: string, mad: Madhab, hlr: HighLatitudeRuleId) => {
+    const id = ++reqId.current;
+    setStatus("loading");
+    try {
+      const days = weekDays(new Date());
+      const results = await Promise.all(
+        days.map(async (d) => {
+          const params = new URLSearchParams({
+            lat: String(c.latitude),
+            lng: String(c.longitude),
+            date: localDate(d.date),
+            method: m,
+            madhab: mad,
+            hlr,
+          });
+          const res = await fetch(`/api/v1/prayer-times?${params}`);
+          if (!res.ok) return null;
+          return (await res.json()) as { timings: ExtendedPrayerTimings };
+        }),
+      );
+      if (id !== reqId.current) return;
+      const filled: WeekDay[] = days.map((d, i) => ({ ...d, timings: results[i]?.timings ?? null }));
+      const today = filled.find((d) => d.isToday)?.timings ?? null;
+      if (!today) throw new Error("missing today");
+      setWeek(filled);
+      setTimings(today);
+      setStatus("ready");
+    } catch {
+      if (id === reqId.current) setStatus("error");
+    }
+    },
+    [],
+  );
+
+  // Restore preferences + last location, and load times if we have a location.
+  useEffect(() => {
+    void webPrayerSettingsStore
+      .read()
+      .then(({ coords: saved, method: m, madhab: mad, highLatitudeRule: hlr }) => {
+        setMethod(m);
+        setMadhab(mad);
+        setHighLat(hlr);
+        if (saved) {
+          setCoords(saved);
+          void fetchTimings(saved, m, mad, hlr);
+        }
+      });
+    void readPrayerReminderPrefs().then(setReminders);
+    setPermission(getNotifier().permission());
+  }, [fetchTimings]);
+
+  // Tick the clock for the live countdown.
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  function locate() {
+    if (!navigator.geolocation) {
+      setStatus("error");
+      return;
+    }
+    setStatus("locating");
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const c = { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
+        setCoords(c);
+        void webPrayerSettingsStore.writeCoords(c);
+        void fetchTimings(c, method, madhab, highLat);
+      },
+      () => setStatus("denied"),
+      { enableHighAccuracy: false, timeout: 10000, maximumAge: 3600000 },
+    );
+  }
+
+  function changeMethod(m: string) {
+    setMethod(m);
+    void webPrayerSettingsStore.writeMethod(m);
+    if (coords) void fetchTimings(coords, m, madhab, highLat);
+  }
+  function changeMadhab(m: Madhab) {
+    setMadhab(m);
+    void webPrayerSettingsStore.writeMadhab(m);
+    if (coords) void fetchTimings(coords, method, m, highLat);
+  }
+  function changeHighLat(r: HighLatitudeRuleId) {
+    setHighLat(r);
+    void webPrayerSettingsStore.writeHighLatitudeRule(r);
+    if (coords) void fetchTimings(coords, method, madhab, r);
+  }
+
+  // Flip one prayer's reminder. Asking for notification permission must happen in
+  // the click; persisting the pref fires the event the layout scheduler listens to.
+  async function toggleReminder(name: PrayerName) {
+    const turningOn = !reminders[name];
+    if (turningOn && getNotifier().permission() === "default") {
+      setPermission(await getNotifier().requestPermission());
+    }
+    setReminders({ ...(await setPrayerReminder(name, turningOn)) });
+  }
+
+  const upcoming = timings ? nextPrayer(timings, now) : null;
+  // Once the day's prayers have passed, the next is tomorrow's Fajr.
+  const next: { name: PrayerName; at: Date } | null =
+    upcoming ??
+    (timings ? { name: "fajr", at: new Date(new Date(timings.fajr).getTime() + 86400000) } : null);
+
+  const selectStyle: CSSProperties = {
+    fontFamily: N.ui,
+    fontSize: 13.5,
+    color: N.fg,
+    background: N.card,
+    border: `1px solid ${N.border}`,
+    borderRadius: 10,
+    padding: "8px 10px",
+  };
+  const ctaBtn: CSSProperties = {
+    fontFamily: N.ui,
+    fontSize: 14,
+    fontWeight: 700,
+    color: N.ink,
+    background: N.goldGrad,
+    border: "none",
+    borderRadius: 11,
+    padding: "11px 20px",
+    cursor: "pointer",
+  };
+
+  return (
+    <div>
+      {!coords && status !== "locating" && (
+        <div
+          style={{ ...cardStyle, padding: 24, display: "flex", flexDirection: "column", gap: 14 }}
+        >
+          <p style={{ margin: 0, color: N.muted, lineHeight: 1.6 }}>
+            See accurate prayer times for where you are. Your location stays on your device.
+          </p>
+          <button type="button" style={{ ...ctaBtn, alignSelf: "flex-start" }} onClick={locate}>
+            📍 Use my location
+          </button>
+        </div>
+      )}
+
+      {status === "locating" && <p style={{ color: N.muted }}>Getting your location…</p>}
+      {status === "denied" && (
+        <div
+          style={{ ...cardStyle, padding: 24, display: "flex", flexDirection: "column", gap: 14 }}
+        >
+          <p style={{ margin: 0, color: N.muted, lineHeight: 1.6 }}>
+            Location permission was denied. Enable it in your browser to see local times.
+          </p>
+          <button
+            type="button"
+            style={{ ...selectStyle, alignSelf: "flex-start", cursor: "pointer" }}
+            onClick={locate}
+          >
+            Try again
+          </button>
+        </div>
+      )}
+      {status === "error" && (
+        <p style={{ color: N.muted }}>
+          Couldn’t load prayer times. Check your connection and retry.
+        </p>
+      )}
+
+      {timings && (
+        <>
+          {next && (
+            <div
+              style={{
+                ...cardStyle,
+                padding: 26,
+                background: `linear-gradient(135deg, ${N.cardHi}, ${N.card})`,
+                position: "relative",
+                overflow: "hidden",
+                marginBottom: 18,
+              }}
+            >
+              <Khatam
+                size={170}
+                color={N.gold}
+                opacity={0.08}
+                sw={1.1}
+                style={{ position: "absolute", right: -40, top: -46 }}
+              />
+              <div
+                style={{
+                  fontSize: 12,
+                  letterSpacing: 1.2,
+                  textTransform: "uppercase",
+                  color: N.faint,
+                  fontWeight: 700,
+                }}
+              >
+                Next prayer
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "baseline",
+                  gap: 14,
+                  margin: "6px 0 2px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <span style={{ fontSize: 38, fontWeight: 800, color: N.gold }}>
+                  {PRAYER_LABELS[next.name]}
+                </span>
+                <span style={{ fontSize: 26, fontWeight: 700, color: N.fg }}>
+                  {fmtPrayerTime(next.at, coords)}
+                </span>
+              </div>
+              <div style={{ fontSize: 14, color: N.muted }}>
+                begins in {countdown(next.at, now)}
+              </div>
+            </div>
+          )}
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+              gap: 12,
+              marginBottom: 24,
+            }}
+          >
+            {TIMING_NAMES.map((name) => {
+              const isNext = upcoming?.name === name && OBLIGATORY_PRAYERS.includes(name);
+              return (
+                <div
+                  key={name}
+                  style={{
+                    ...cardStyle,
+                    padding: "16px 18px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 12,
+                    borderColor: isNext ? N.gold : N.border,
+                    background: isNext ? N.goldSoft : N.card,
+                  }}
+                >
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div
+                      style={{ fontSize: 14.5, fontWeight: 700, color: isNext ? N.goldHi : N.fg }}
+                    >
+                      {PRAYER_LABELS[name]}
+                    </div>
+                    <div style={{ fontSize: 12, color: N.faint }}>
+                      {name === "sunrise" ? "Shurūq" : "Adhān"}
+                    </div>
+                  </div>
+                  <span
+                    style={{
+                      fontSize: 17,
+                      fontWeight: 700,
+                      color: isNext ? N.goldHi : N.fg,
+                      fontVariantNumeric: "tabular-nums",
+                      flexShrink: 0,
+                    }}
+                  >
+                    {fmtPrayerTime(timings[name], coords)}
+                  </span>
+                  {/* Reserve the toggle slot on every card (incl. Sunrise) so the
+                      times line up in a column. */}
+                  <span
+                    style={{
+                      width: 18,
+                      flexShrink: 0,
+                      display: "flex",
+                      justifyContent: "center",
+                    }}
+                  >
+                    {OBLIGATORY_PRAYERS.includes(name) &&
+                      (() => {
+                        const on = !!reminders[name];
+                        return (
+                          <button
+                            type="button"
+                            onClick={() => void toggleReminder(name)}
+                            aria-pressed={on}
+                            aria-label={`${on ? "Turn off" : "Turn on"} the ${PRAYER_LABELS[name]} reminder`}
+                            title={on ? "Reminder on" : "Remind me"}
+                            style={{
+                              background: "none",
+                              border: "none",
+                              cursor: "pointer",
+                              padding: 0,
+                              display: "flex",
+                              color: on ? N.gold : N.faint,
+                            }}
+                          >
+                            <Icon name={on ? "check" : "plus"} size={18} color={on ? N.gold : N.faint} />
+                          </button>
+                        );
+                      })()}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+
+          <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 12 }}>Night</div>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+              gap: 12,
+              marginBottom: 24,
+            }}
+          >
+            {SUPPLEMENTARY_TIMING_NAMES.map((name) => (
+              <div
+                key={name}
+                style={{
+                  ...cardStyle,
+                  padding: "16px 18px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 12,
+                }}
+              >
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 14.5, fontWeight: 700, color: N.fg }}>
+                    {SUPPLEMENTARY_TIMING_LABELS[name]}
+                  </div>
+                </div>
+                <span
+                  style={{
+                    fontSize: 17,
+                    fontWeight: 700,
+                    color: N.fg,
+                    fontVariantNumeric: "tabular-nums",
+                    flexShrink: 0,
+                  }}
+                >
+                  {timings[name] ? fmtPrayerTime(timings[name], coords) : "—"}
+                </span>
+              </div>
+            ))}
+          </div>
+          {OBLIGATORY_PRAYERS.some((p) => reminders[p]) && (
+            <p style={{ marginTop: -10, marginBottom: 22, color: N.faint, fontSize: 13 }}>
+              {permission === "denied"
+                ? "Notifications are blocked in your browser — enable them to be reminded."
+                : permission === "unsupported"
+                  ? "This browser can’t show notifications."
+                  : "🔔 Reminders ring while Qur’an Learn with Mahfuz is open in a tab."}
+            </p>
+          )}
+
+          {week.length > 0 && (
+            <>
+              <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 12 }}>This week</div>
+              <div
+                className="noor-scroll"
+                style={{ ...cardStyle, padding: 6, overflowX: "auto", marginBottom: 24 }}
+              >
+                <div style={{ display: "flex", minWidth: 520 }}>
+                  {week.map((d) => (
+                    <div
+                      key={localDate(d.date)}
+                      style={{
+                        flex: 1,
+                        textAlign: "center",
+                        padding: "12px 6px",
+                        borderRadius: 11,
+                        background: d.isToday ? N.goldSoft : "transparent",
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontSize: 12,
+                          color: d.isToday ? N.gold : N.faint,
+                          fontWeight: 700,
+                          marginBottom: 10,
+                        }}
+                      >
+                        {d.label}
+                      </div>
+                      {OBLIGATORY_PRAYERS.map((p) => (
+                        <div
+                          key={p}
+                          style={{
+                            fontSize: 12,
+                            color: N.muted,
+                            padding: "3px 0",
+                            fontVariantNumeric: "tabular-nums",
+                          }}
+                        >
+                          {d.timings ? fmtPrayerTime(d.timings[p], coords) : "—"}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 16, alignItems: "flex-end" }}>
+            <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <span style={{ fontSize: 12.5, color: N.muted }}>Calculation method</span>
+              <select
+                value={method}
+                onChange={(e) => changeMethod(e.target.value)}
+                style={selectStyle}
+              >
+                {CALCULATION_METHODS.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <span style={{ fontSize: 12.5, color: N.muted }}>Asr (madhab)</span>
+              <select
+                value={madhab}
+                onChange={(e) => changeMadhab(e.target.value as Madhab)}
+                style={selectStyle}
+              >
+                {MADHABS.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <span style={{ fontSize: 12.5, color: N.muted }}>High-latitude rule</span>
+              <select
+                value={highLat}
+                onChange={(e) => changeHighLat(e.target.value as HighLatitudeRuleId)}
+                style={selectStyle}
+              >
+                {HIGH_LATITUDE_RULES.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button type="button" style={{ ...selectStyle, cursor: "pointer" }} onClick={locate}>
+              📍 Update location
+            </button>
+          </div>
+          <p style={{ marginTop: 18, color: N.faint, fontSize: 13 }}>
+            Times computed locally with the adhan library · {localDate(now)}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}

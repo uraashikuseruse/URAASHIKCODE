@@ -1,0 +1,16 @@
+node_modules
+dist
+.next
+.turbo
+.expo
+.vercel
+pnpm-lock.yaml
+LICENSE
+
+# Generated Quran datasets (compact JSON produced by `pnpm --filter @ummahlibrary/data ingest`)
+packages/data/datasets
+
+# Vendored design-reference snapshots — kept verbatim, not reformatted
+docs/design/noor-prototype
+docs/design/noor-prototype-mobile
+docs/design/noor-prototype-blog

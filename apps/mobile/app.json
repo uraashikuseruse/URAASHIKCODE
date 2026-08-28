@@ -1,0 +1,67 @@
+{
+  "expo": {
+    "name": "Qur’an Learn with Mahfuz",
+    "slug": "quran-learn-with-mahfuz",
+    "version": "1.0.1",
+    "orientation": "portrait",
+    "scheme": "ummahlibrary",
+    "userInterfaceStyle": "dark",
+    "icon": "./assets/icon.png",
+    "backgroundColor": "#0b0f0e",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0b0f0e"
+    },
+    "android": {
+      "package": "org.ummahlibrary.app",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0b0f0e"
+      },
+      "permissions": [
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.POST_NOTIFICATIONS"
+      ],
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "org.ummahlibrary.app",
+      "supportsTablet": true,
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "audio"
+        ],
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": [
+      "expo-audio",
+      "expo-asset",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow Qur’an Learn with Mahfuz to use your location to calculate prayer times and find the qibla direction."
+        }
+      ],
+      "expo-font",
+      "expo-notifications",
+      "@react-native-community/datetimepicker"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "ece93f61-b220-47ff-ab00-1717a57ca628"
+      }
+    },
+    "owner": "rashidmahmood"
+  }
+}

@@ -1,0 +1,37 @@
+import { N } from "@ummahlibrary/ui";
+import { pluginRegistry } from "@ummahlibrary/api";
+import { NoorPageFrame } from "../../components/NoorPageFrame";
+import { HadithBrowser } from "../../components/HadithBrowser";
+
+export const metadata = {
+  title: "Hadith",
+  description:
+    "Search the prophetic tradition across the six major collections — Bukhārī, Muslim, Abū Dāwūd, Tirmidhī, Nasāʾī and Ibn Mājah — with grade filters, on Qur’an Learn with Mahfuz.",
+};
+
+const COLLECTIONS = pluginRegistry.byKind("hadith").map((c) => ({ id: c.id, name: c.name }));
+
+export default function HadithPage() {
+  return (
+    <NoorPageFrame
+      title="Hadith"
+      sub="Search the prophetic tradition across the major collections"
+      glyph="📖"
+      back="/"
+      maxW={900}
+    >
+      <HadithBrowser collections={COLLECTIONS} />
+      <p
+        style={{
+          fontSize: 12,
+          color: N.faint,
+          textAlign: "center",
+          marginTop: 32,
+          fontFamily: "'Hanken Grotesk', system-ui, sans-serif",
+        }}
+      >
+        Source: fawazahmed0/hadith-api
+      </p>
+    </NoorPageFrame>
+  );
+}
